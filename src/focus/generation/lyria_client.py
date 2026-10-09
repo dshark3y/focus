@@ -284,6 +284,11 @@ class LyriaClient:
     # so the UI can tell the listener why they are hearing a drone.
     fallback_reason: str | None = field(default=None, init=False)
 
+    @property
+    def using_synth(self) -> bool:
+        """True once Lyria failed and the synth fallback is playing."""
+        return self.fallback_reason is not None
+
     def __post_init__(self):
         if not GENAI_AVAILABLE:
             raise ImportError(
@@ -567,6 +572,8 @@ class EnhancedSynthClient:
     Used when Lyria API is unavailable. Generates rich ambient textures
     using additive synthesis with detuned oscillators and stereo widening.
     """
+
+    using_synth = True
 
     def __init__(self, config: LyriaConfig, verbose: bool = False):
         self.config = config

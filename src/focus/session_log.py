@@ -24,12 +24,13 @@ class SessionRecord:
     planned_seconds: int | None  # None for open-ended sessions
     audio_seconds: float  # music actually streamed (pauses don't count)
     outcome: str  # completed | quit | interrupted | ended | error
-    engine: str  # lyria | synth
+    engine: str  # lyria (realtime) | lyria-3.5 | synth
     modulation_freq: float
     modulation_depth: float
     fallback_reason: str | None = None
     cycle: int | None = None  # pomodoro block number, 1-based
     cycles: int | None = None  # pomodoro blocks planned
+    paid_requests: int | None = None  # Lyria 3.5 tracks generated (billed)
 
 
 def now_iso() -> str:

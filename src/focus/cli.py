@@ -11,7 +11,11 @@ import click
 from focus.dsp.dynamics import LimiterState, apply_limiter
 from focus.dsp.entrainment import ModulationState, apply_entrainment, apply_fade_out
 from focus.dsp.spatial import ReverbState, apply_reverb, apply_stereo_widening
-from focus.generation.lyria_client import LyriaConfig, create_client, resolve_api_key
+from focus.generation.lyria_client import (
+    LyriaConfig,
+    create_client,
+    resolve_api_key,
+)
 from focus.profiles import BREAK_PROFILE, FocusProfile, get_profile, list_profiles
 from focus.session_log import (
     SessionRecord,
@@ -178,6 +182,20 @@ def show_profiles():
     help="Live audio spectrum visualizer (interactive terminal only, default: on)",
 )
 @click.option(
+    "--engine",
+    type=click.Choice(["realtime", "lyria-3.5"]),
+    default="realtime",
+    show_default=True,
+    help="realtime: endless live stream (Lyria RealTime). lyria-3.5: generated "
+    "~2.5 min tracks blended together ($0.08 per track, cached for reuse)",
+)
+@click.option(
+    "--cached-only",
+    is_flag=True,
+    default=False,
+    help="With --engine lyria-3.5: replay cached tracks only (no API calls, no cost)",
+)
+@click.option(
     "--pomodoro",
     type=str,
     default=None,
@@ -221,6 +239,8 @@ def start_session(
     cycles: int,
     log_session: bool,
     notify: bool,
+    engine: str,
+    cached_only: bool,
 ):
     """Start a focus music session.
 
@@ -233,6 +253,8 @@ def start_session(
         focus start --frequency 16 --depth 0.3 --mock
 
         focus start -p deep-work --pomodoro 50/10 --cycles 3
+
+        focus start -p light-study --engine lyria-3.5
     """
     launch_session(
         profile=profile,
@@ -253,6 +275,8 @@ def start_session(
         cycles=cycles,
         log_session=log_session,
         notify=notify,
+        engine=engine,
+        cached_only=cached_only,
     )
 
 
@@ -330,6 +354,8 @@ def launch_session(
     cycles: int = 4,
     log_session: bool = True,
     notify: bool = True,
+    engine: str = "realtime",
+    cached_only: bool = False,
 ):
     """Resolve a profile, apply overrides, and run a session.
 
@@ -361,8 +387,12 @@ def launch_session(
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
 
+    if cached_only and engine != "lyria-3.5":
+        click.echo("Error: --cached-only needs --engine lyria-3.5.", err=True)
+        sys.exit(1)
+
     # Fail fast, before the terminal is put into key-reading mode
-    if not mock and not resolve_api_key():
+    if not mock and not cached_only and not resolve_api_key():
         click.echo(
             "Error: no API key. Set GOOGLE_API_KEY (or GEMINI_API_KEY), "
             "or use --mock to try it without one.",
@@ -387,6 +417,9 @@ def launch_session(
             f"Brightness: {focus_profile.brightness}"
         )
         click.echo(f"   Prompt: {focus_profile.prompt[:60]}...")
+    if engine == "lyria-3.5" and not mock:
+        source = "cached tracks only, no cost" if cached_only else "$0.08 per generated track"
+        click.echo(f"   Engine: Lyria 3.5 ({source})")
     if duration:
         click.echo(f"   Duration: {duration} seconds")
     if blocks:
@@ -415,6 +448,8 @@ def launch_session(
                 track_duration=track_duration,
                 spectrum=spectrum,
                 log_session=log_session and not mock,
+                engine=engine,
+                cached_only=cached_only,
                 **block,
             )
         )
@@ -487,6 +522,8 @@ async def _run_session(
     cycle: int | None = None,
     cycles: int | None = None,
     log_session: bool = False,
+    engine: str = "realtime",
+    cached_only: bool = False,
 ) -> str:
     """Run the audio generation session.
 
@@ -527,6 +564,16 @@ async def _run_session(
         return LyriaConfig(prompt=profile.prompt, bpm=bpm, density=density, brightness=brightness)
 
     def make_client(phase: str):
+        if engine == "lyria-3.5" and not use_mock:
+            from focus.generation.track_client import TrackClient
+
+            return TrackClient(
+                build_config(phase),
+                profile=profile.name,
+                verbose=verbose,
+                cached_only=cached_only,
+                main_prompt=profile.prompt,
+            )
         return create_client(
             build_config(phase),
             use_mock=use_mock,
@@ -832,7 +879,9 @@ async def _run_session(
                     state.elapsed_seconds = total_seconds
                     state.buffer_seconds = output.buffer_seconds
                     state.status = (
-                        "synth fallback" if getattr(client, "fallback_reason", None) else "playing"
+                        "synth fallback"
+                        if getattr(client, "using_synth", False) and not use_mock
+                        else "playing"
                     )
                     if status_line is not None:
                         status_line.render(state)
@@ -840,6 +889,11 @@ async def _run_session(
                         outcome = "quit"
                         session_complete = True
                         break
+                    resumable = getattr(client, "resumable", False)
+                    if state.skip_requested and resumable:
+                        # Track engine: blend into the next queued track in place
+                        client.skip()
+                        state.skip_requested = False
                     if state.paused or state.skip_requested:
                         reconnect = True
                         break
@@ -858,9 +912,11 @@ async def _run_session(
                 break
 
             # Pause: tear the session down (stops burning quota), wait, reconnect
+            resumable = getattr(client, "resumable", False)
             if state.paused:
                 output.pause()
-                await client.stop()
+                if not resumable:
+                    await client.stop()
                 state.status = "paused"
                 if status_line is not None:
                     status_line.render(state)
@@ -872,6 +928,10 @@ async def _run_session(
                     outcome = "quit"
                     break
                 output.resume()
+                if resumable:
+                    # Keep the queued tracks: carry on from where playback stopped
+                    fade_in_samples_remaining = int(fade_duration * sample_rate)
+                    continue
 
             # "Next take": force a fresh generation (same profile/phase)
             state.skip_requested = False
@@ -932,7 +992,12 @@ async def _run_session(
                 planned_seconds=duration,
                 audio_seconds=round(total_seconds, 1),
                 outcome=outcome,
-                engine="synth" if use_mock or fallback_reason else "lyria",
+                engine=(
+                    "synth"
+                    if use_mock or getattr(client, "using_synth", False)
+                    else getattr(client, "engine_name", "lyria")
+                ),
+                paid_requests=getattr(client, "paid_requests", None),
                 modulation_freq=profile.modulation_freq,
                 modulation_depth=profile.modulation_depth,
                 fallback_reason=fallback_reason,
@@ -943,10 +1008,16 @@ async def _run_session(
                 append_record(record)
             except OSError as e:
                 click.echo(f"   ⚠️  Could not write focus log: {e}", err=True)
-        if fallback_reason:
+        if fallback_reason and getattr(client, "using_synth", False) and not use_mock:
             click.echo(
                 f"   ⚠️  Lyria was unavailable ({fallback_reason}); "
                 "played the fallback synth instead.",
+                err=True,
+            )
+        elif fallback_reason:
+            click.echo(
+                f"   ⚠️  Lyria 3.5 stopped generating ({fallback_reason}); "
+                "played cached tracks instead.",
                 err=True,
             )
         if verbose:
