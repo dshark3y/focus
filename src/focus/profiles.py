@@ -144,6 +144,25 @@ PROFILES: dict[str, FocusProfile] = {
 }
 
 
+# Pomodoro break music. Kept out of PROFILES so it isn't offered as a focus
+# mode; depth 0 means no entrainment while resting.
+BREAK_PROFILE = FocusProfile(
+    name="break",
+    description="Pomodoro break: calm ambient with no entrainment",
+    prompt=(
+        "Calm ambient, soft warm pads, gentle slow movement, no percussion, "
+        "no vocals, relaxing, spacious, restful"
+    ),
+    modulation_freq=10.0,
+    modulation_depth=0.0,
+    bpm=70,
+    density=0.2,
+    brightness=0.5,
+    intro_prompt="softly settling in, gentle unhurried start",
+    outro_prompt="gently fading, quiet ending, ready to return",
+)
+
+
 def get_profile(name: str) -> FocusProfile:
     """Get a focus profile by name.
 

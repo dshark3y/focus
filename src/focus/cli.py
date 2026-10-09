@@ -1,6 +1,8 @@
 """Command-line interface for Focus music generator."""
 
 import asyncio
+import json
+import re
 import sys
 from dataclasses import replace
 
@@ -10,7 +12,16 @@ from focus.dsp.dynamics import LimiterState, apply_limiter
 from focus.dsp.entrainment import ModulationState, apply_entrainment, apply_fade_out
 from focus.dsp.spatial import ReverbState, apply_reverb, apply_stereo_widening
 from focus.generation.lyria_client import LyriaConfig, create_client, resolve_api_key
-from focus.profiles import FocusProfile, get_profile, list_profiles
+from focus.profiles import BREAK_PROFILE, FocusProfile, get_profile, list_profiles
+from focus.session_log import (
+    SessionRecord,
+    append_record,
+    format_summary,
+    log_path,
+    now_iso,
+    read_records,
+    summarize,
+)
 from focus.ui.transport import KeyboardController, PlaybackState, StatusLine
 
 # Spectrum visualizer is optional; imported lazily in _run_session so the CLI
@@ -166,6 +177,31 @@ def show_profiles():
     default=True,
     help="Live audio spectrum visualizer (interactive terminal only, default: on)",
 )
+@click.option(
+    "--pomodoro",
+    type=str,
+    default=None,
+    metavar="WORK/BREAK",
+    help="Pomodoro cycles in minutes, e.g. 50/10 or 25/5 (breaks play calm music)",
+)
+@click.option(
+    "--cycles",
+    type=click.IntRange(min=1),
+    default=4,
+    show_default=True,
+    help="Number of work blocks in a pomodoro run",
+)
+@click.option(
+    "--log/--no-log",
+    "log_session",
+    default=True,
+    help="Record the session in the focus log (see 'focus log', default: on)",
+)
+@click.option(
+    "--notify/--no-notify",
+    default=True,
+    help="macOS notification at each pomodoro transition (default: on)",
+)
 def start_session(
     profile: str,
     frequency: float | None,
@@ -181,6 +217,10 @@ def start_session(
     verbose: bool,
     track_duration: int,
     spectrum: bool,
+    pomodoro: str | None,
+    cycles: int,
+    log_session: bool,
+    notify: bool,
 ):
     """Start a focus music session.
 
@@ -191,6 +231,8 @@ def start_session(
         focus start -p light-study --duration 300
 
         focus start --frequency 16 --depth 0.3 --mock
+
+        focus start -p deep-work --pomodoro 50/10 --cycles 3
     """
     launch_session(
         profile=profile,
@@ -207,7 +249,40 @@ def start_session(
         verbose=verbose,
         track_duration=track_duration,
         spectrum=spectrum,
+        pomodoro=pomodoro,
+        cycles=cycles,
+        log_session=log_session,
+        notify=notify,
     )
+
+
+def parse_pomodoro(spec: str) -> tuple[int, int]:
+    """Parse 'WORK/BREAK' minutes (e.g. '50/10') into seconds.
+
+    Raises:
+        ValueError: if the spec is malformed or either block is under a minute.
+    """
+    match = re.fullmatch(r"\s*(\d+)\s*/\s*(\d+)\s*", spec)
+    if not match:
+        raise ValueError(
+            f"--pomodoro must look like WORK/BREAK in minutes, e.g. 50/10 (got {spec!r})"
+        )
+    work, brk = int(match.group(1)), int(match.group(2))
+    if work < 1 or brk < 1:
+        raise ValueError("--pomodoro work and break blocks must each be at least 1 minute")
+    return work * 60, brk * 60
+
+
+def pomodoro_blocks(
+    work_seconds: int, break_seconds: int, cycles: int
+) -> list[tuple[str, int, int]]:
+    """Block plan as (kind, cycle, seconds): work, break, ..., work (no trailing break)."""
+    blocks: list[tuple[str, int, int]] = []
+    for cycle in range(1, cycles + 1):
+        blocks.append(("work", cycle, work_seconds))
+        if cycle < cycles:
+            blocks.append(("break", cycle, break_seconds))
+    return blocks
 
 
 def apply_overrides(
@@ -251,6 +326,10 @@ def launch_session(
     verbose: bool = False,
     track_duration: int = 9,
     spectrum: bool = True,
+    pomodoro: str | None = None,
+    cycles: int = 4,
+    log_session: bool = True,
+    notify: bool = True,
 ):
     """Resolve a profile, apply overrides, and run a session.
 
@@ -263,6 +342,18 @@ def launch_session(
             err=True,
         )
         sys.exit(1)
+
+    blocks = None
+    if pomodoro:
+        if duration is not None or output:
+            click.echo("Error: --pomodoro can't be combined with --duration or --output.", err=True)
+            sys.exit(1)
+        try:
+            work_seconds, break_seconds = parse_pomodoro(pomodoro)
+        except ValueError as e:
+            click.echo(f"Error: {e}", err=True)
+            sys.exit(1)
+        blocks = pomodoro_blocks(work_seconds, break_seconds, cycles)
 
     try:
         focus_profile = get_profile(profile)
@@ -298,6 +389,11 @@ def launch_session(
         click.echo(f"   Prompt: {focus_profile.prompt[:60]}...")
     if duration:
         click.echo(f"   Duration: {duration} seconds")
+    if blocks:
+        click.echo(
+            f"   Pomodoro: {cycles} × {work_seconds // 60} min work, "
+            f"{break_seconds // 60} min breaks"
+        )
     if output:
         click.echo(f"   Output: {output}")
     if sys.stdin.isatty() and sys.stdout.isatty():
@@ -305,12 +401,12 @@ def launch_session(
     else:
         click.echo("\n   Press Ctrl+C to stop\n")
 
-    try:
-        asyncio.run(
+    def run(block_profile: FocusProfile, block_duration: int | None, **block) -> str:
+        return asyncio.run(
             _run_session(
-                focus_profile,
+                block_profile,
                 mock,
-                duration,
+                block_duration,
                 output,
                 reverb=reverb,
                 stereo_width=stereo_width,
@@ -318,14 +414,62 @@ def launch_session(
                 verbose=verbose,
                 track_duration=track_duration,
                 spectrum=spectrum,
+                log_session=log_session and not mock,
+                **block,
             )
         )
+
+    try:
+        if blocks is None:
+            run(focus_profile, duration)
+        else:
+            _run_pomodoro(focus_profile, blocks, cycles, run, notify=notify)
     except KeyboardInterrupt:
         click.echo("\n\n🛑 Session stopped by user")
 
     if output:
         click.echo(f"💾 Audio saved to: {output}")
     click.echo("👋 Session ended. Stay focused!\n")
+
+
+def _run_pomodoro(
+    work_profile: FocusProfile,
+    blocks: list[tuple[str, int, int]],
+    cycles: int,
+    run,
+    notify: bool = True,
+) -> None:
+    """Play work and break blocks in turn; stop early if a block is quit."""
+    from focus.ui.notify import notify as send_notification
+
+    for index, (kind, cycle, seconds) in enumerate(blocks):
+        minutes = seconds // 60
+        if kind == "work":
+            click.echo(f"🍅 Work block {cycle}/{cycles} · {minutes} min")
+            block_profile = work_profile
+        else:
+            click.echo(f"☕ Break · {minutes} min")
+            block_profile = BREAK_PROFILE
+
+        outcome = run(block_profile, seconds, kind=kind, cycle=cycle, cycles=cycles)
+        if outcome != "completed":
+            click.echo(f"   Pomodoro stopped during {kind} block {cycle}/{cycles}.")
+            return
+
+        is_last = index == len(blocks) - 1
+        if not notify:
+            continue
+        if is_last:
+            send_notification("Focus", f"Pomodoro done: {cycles} work blocks complete")
+        elif kind == "work":
+            next_minutes = blocks[index + 1][2] // 60
+            send_notification(
+                "Focus", f"Work block {cycle}/{cycles} done. {next_minutes} min break."
+            )
+        else:
+            send_notification("Focus", f"Break over. Work block {cycle + 1}/{cycles}.")
+
+    click.echo(f"🎉 Pomodoro complete: {cycles} work blocks")
 
 
 async def _run_session(
@@ -339,14 +483,22 @@ async def _run_session(
     verbose: bool = False,
     track_duration: int = 9,
     spectrum: bool = True,
-):
-    """Run the audio generation session."""
+    kind: str = "focus",
+    cycle: int | None = None,
+    cycles: int | None = None,
+    log_session: bool = False,
+) -> str:
+    """Run the audio generation session.
+
+    Returns how it ended: completed (duration reached), quit, interrupted,
+    ended (stream stopped on its own) or error.
+    """
     try:
         from focus.audio.output import AudioOutput, FileAudioOutput
     except ImportError:
         if not use_mock:
             click.echo("Error: sounddevice not available", err=True)
-            return
+            return "error"
 
     sample_rate = 48000
 
@@ -396,9 +548,11 @@ async def _run_session(
             if chunk_count >= 10:
                 break
         await client.stop()
-        return
+        return "ended"
 
     current_phase = "intro" if duration and profile.intro_prompt else "main"
+    started_at = now_iso()
+    outcome = "ended"
 
     # Connect to generator before touching the terminal, so a connection error
     # can't leave it in cbreak mode with the display half drawn.
@@ -416,7 +570,9 @@ async def _run_session(
     spectrum_task = None
     if interactive:
         state = PlaybackState(
-            profile_name=profile.name,
+            profile_name=(
+                f"{profile.name} · {kind} {cycle}/{cycles}" if cycle is not None else profile.name
+            ),
             modulation_freq=profile.modulation_freq,
             modulation_depth=profile.modulation_depth,
             status="connecting",
@@ -667,6 +823,7 @@ async def _run_session(
                         faded = apply_fade_out(combined, sample_rate, fade_duration)
                         file_output.write(faded)
                         fade_out_buffer.clear()
+                    outcome = "completed"
                     session_complete = True
                     break
 
@@ -680,6 +837,7 @@ async def _run_session(
                     if status_line is not None:
                         status_line.render(state)
                     if state.quit_requested:
+                        outcome = "quit"
                         session_complete = True
                         break
                     if state.paused or state.skip_requested:
@@ -711,6 +869,7 @@ async def _run_session(
                     if status_line is not None:
                         status_line.render(state)
                 if state.quit_requested:
+                    outcome = "quit"
                     break
                 output.resume()
 
@@ -726,8 +885,9 @@ async def _run_session(
             fade_in_samples_remaining = int(fade_duration * sample_rate)
 
     except asyncio.CancelledError:
-        pass
+        outcome = "interrupted"
     except Exception as e:
+        outcome = "error"
         session_error = e
         if verbose:
             import traceback
@@ -763,6 +923,26 @@ async def _run_session(
         if session_error is not None:
             click.echo(f"   ⚠️  Session error: {session_error}", err=True)
         fallback_reason = getattr(client, "fallback_reason", None)
+        if log_session and total_seconds > 0:
+            record = SessionRecord(
+                started_at=started_at,
+                ended_at=now_iso(),
+                profile=profile.name,
+                kind=kind,
+                planned_seconds=duration,
+                audio_seconds=round(total_seconds, 1),
+                outcome=outcome,
+                engine="synth" if use_mock or fallback_reason else "lyria",
+                modulation_freq=profile.modulation_freq,
+                modulation_depth=profile.modulation_depth,
+                fallback_reason=fallback_reason,
+                cycle=cycle,
+                cycles=cycles,
+            )
+            try:
+                append_record(record)
+            except OSError as e:
+                click.echo(f"   ⚠️  Could not write focus log: {e}", err=True)
         if fallback_reason:
             click.echo(
                 f"   ⚠️  Lyria was unavailable ({fallback_reason}); "
@@ -778,6 +958,19 @@ async def _run_session(
                 f"   ✓ Session ended after {total_seconds:.1f}s "
                 f"({chunk_count} chunks{underrun_msg}{buffer_info})"
             )
+    return outcome
+
+
+@main.command("log")
+@click.option("--days", type=click.IntRange(min=1), default=7, show_default=True)
+@click.option("--json", "as_json", is_flag=True, default=False, help="Machine-readable output")
+def show_log(days: int, as_json: bool):
+    """Show focus time per day from the session log."""
+    summary = summarize(read_records(), days=days)
+    if as_json:
+        click.echo(json.dumps({"log_path": str(log_path()), **summary}, indent=2))
+    else:
+        click.echo(format_summary(summary))
 
 
 @main.command("test-audio")
