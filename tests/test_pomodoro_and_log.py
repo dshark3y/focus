@@ -108,21 +108,21 @@ class TestPomodoroCliValidation:
 class TestSessionLog:
     def test_append_and_read_round_trip(self, tmp_path):
         path = tmp_path / "nested" / "sessions.jsonl"
-        append_record(_record("2026-10-09T09:00:00+04:00"), path)
-        append_record(_record("2026-10-09T10:00:00+04:00", kind="break"), path)
+        append_record(_record("2026-10-09T09:00:00+00:00"), path)
+        append_record(_record("2026-10-09T10:00:00+00:00", kind="break"), path)
         path.write_text(path.read_text() + "not json\n")
         records = read_records(path)
         assert [r["kind"] for r in records] == ["focus", "break"]
 
     def test_summary_separates_focus_and_break_and_counts_blocks(self, tmp_path):
         path = tmp_path / "s.jsonl"
-        append_record(_record("2026-10-09T09:00:00+04:00", kind="work", seconds=1500), path)
-        append_record(_record("2026-10-09T09:25:00+04:00", kind="break", seconds=300), path)
+        append_record(_record("2026-10-09T09:00:00+00:00", kind="work", seconds=1500), path)
+        append_record(_record("2026-10-09T09:25:00+00:00", kind="break", seconds=300), path)
         append_record(
-            _record("2026-10-09T09:30:00+04:00", kind="work", seconds=600, outcome="quit"), path
+            _record("2026-10-09T09:30:00+00:00", kind="work", seconds=600, outcome="quit"), path
         )
-        append_record(_record("2026-10-08T20:00:00+04:00", profile="light-study"), path)
-        append_record(_record("2026-09-01T20:00:00+04:00"), path)  # outside window
+        append_record(_record("2026-10-08T20:00:00+00:00", profile="light-study"), path)
+        append_record(_record("2026-09-01T20:00:00+00:00"), path)  # outside window
 
         summary = summarize(read_records(path), days=2, today=date(2026, 10, 9))
         yesterday, today = summary["days"]
@@ -136,7 +136,7 @@ class TestSessionLog:
 
     def test_summary_counts_paid_tracks_and_cost(self, tmp_path):
         path = tmp_path / "s.jsonl"
-        rec = _record("2026-10-09T09:00:00+04:00")
+        rec = _record("2026-10-09T09:00:00+00:00")
         rec.engine, rec.paid_requests = "lyria-3.5", 3
         append_record(rec, path)
         summary = summarize(read_records(path), days=1, today=date(2026, 10, 9))
@@ -151,7 +151,7 @@ class TestSessionLog:
     def test_log_command_json(self, tmp_path, monkeypatch):
         path = tmp_path / "s.jsonl"
         monkeypatch.setenv("FOCUS_LOG_PATH", str(path))
-        append_record(_record(f"{date.today().isoformat()}T09:00:00+04:00"), path)
+        append_record(_record(f"{date.today().isoformat()}T09:00:00+00:00"), path)
         result = CliRunner().invoke(main, ["log", "--days", "1", "--json"])
         assert result.exit_code == 0
         data = json.loads(result.output)
