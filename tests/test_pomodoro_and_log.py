@@ -159,3 +159,39 @@ class TestNotify:
         script = applescript_notification('Fo"cus', "Break over.")
         assert 'with title "Fo\\"cus"' in script
         assert 'display notification "Break over."' in script
+
+
+class TestEngineSwitching:
+    def test_e_key_requests_switch_and_status_shows_engine(self):
+        from focus.ui.transport import PlaybackState, format_status_line
+
+        state = PlaybackState(profile_name="deep-work", engine_label="lyria-3.5")
+        state.handle_key(b"e")
+        assert state.engine_switch_requested
+        assert "lyria-3.5" in format_status_line(state)
+
+    def test_default_engine_from_env(self, monkeypatch):
+        monkeypatch.setenv("FOCUS_ENGINE", "lyria-3.5")
+        assert cli.default_engine() == "lyria-3.5"
+        monkeypatch.setenv("FOCUS_ENGINE", "bogus")
+        assert cli.default_engine() == "realtime"
+
+    def test_launcher_e_toggles_engine(self, monkeypatch):
+        import io
+
+        from focus.ui import launcher
+
+        keys = iter([b"e", b"\r"])
+        monkeypatch.setattr(launcher, "_getch", lambda: next(keys))
+        monkeypatch.setattr(launcher.sys, "stdout", io.StringIO())
+        name, engine = launcher.run_launcher(engine="realtime")
+        assert engine == "lyria-3.5"
+
+    def test_tracks_command(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("FOCUS_CACHE_DIR", str(tmp_path))
+        result = CliRunner().invoke(main, ["tracks"])
+        assert "empty" in result.output
+        (tmp_path / "deep-work").mkdir()
+        (tmp_path / "deep-work" / "a.wav").write_bytes(b"RIFF0000")
+        result = CliRunner().invoke(main, ["tracks"])
+        assert "deep-work" in result.output and "1 tracks" in result.output

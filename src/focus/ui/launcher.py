@@ -50,7 +50,14 @@ def _getch(fd: int | None = None) -> bytes:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
-def _menu_lines(profiles: list[FocusProfile], selected: int) -> list[str]:
+ENGINES = ("realtime", "lyria-3.5")
+ENGINE_NOTES = {
+    "realtime": "live endless stream",
+    "lyria-3.5": "generated tracks, reused from your library",
+}
+
+
+def _menu_lines(profiles: list[FocusProfile], selected: int, engine: str = "realtime") -> list[str]:
     """Build the menu as a list of single (unwrapped) lines.
 
     Returning exact lines lets the redraw move the cursor up by a precise count;
@@ -64,12 +71,14 @@ def _menu_lines(profiles: list[FocusProfile], selected: int) -> list[str]:
         lines.append(f"      {p.description}")
         lines.append(f"      {p.modulation_freq:.0f} Hz @ {p.modulation_depth:.0%}")
     lines.append("")
-    lines.append("  ↑↓ move · 1-9 jump · Enter start · q cancel")
+    eng = click.style(engine, fg="cyan", bold=True)
+    lines.append(f"  Engine: {eng} ({ENGINE_NOTES.get(engine, '')})")
+    lines.append("  ↑↓ move · 1-9 jump · e engine · Enter start · q cancel")
     return lines
 
 
-def run_launcher() -> str | None:
-    """Show the picker and return the chosen profile name, or None if cancelled.
+def run_launcher(engine: str = "realtime") -> tuple[str, str] | None:
+    """Show the picker; return (profile name, engine), or None if cancelled.
 
     Caller is responsible for ensuring stdin is a TTY.
     """
@@ -82,7 +91,7 @@ def run_launcher() -> str | None:
     out = sys.stdout
     try:
         while True:
-            lines = _menu_lines(profiles, selected)
+            lines = _menu_lines(profiles, selected, engine)
             out.write("\x1b[?7l")
             if prev_lines:
                 # Return to the top of the previous block and clear everything
@@ -96,7 +105,10 @@ def run_launcher() -> str | None:
 
             key = _getch()
             if key in (b"\r", b"\n"):
-                return profiles[selected].name
+                return profiles[selected].name, engine
+            if key in (b"e", b"E"):
+                engine = ENGINES[(ENGINES.index(engine) + 1) % len(ENGINES)]
+                continue
             if key in (b"q", b"Q", b"\x1b"):
                 return None
             if key == b"\x1b[A":  # up

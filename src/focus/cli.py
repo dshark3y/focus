@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import re
 import sys
 from dataclasses import replace
@@ -67,11 +68,32 @@ def main(ctx):
     if sys.stdin.isatty() and sys.stdout.isatty():
         from focus.ui.launcher import run_launcher
 
-        choice = run_launcher()
+        choice = run_launcher(engine=default_engine())
         if choice:
-            launch_session(profile=choice)
+            profile, engine = choice
+            launch_session(profile=profile, engine=engine)
     else:
         click.echo(ctx.get_help())
+
+
+ENGINE_CHOICES = ("realtime", "lyria-3.5")
+
+
+def default_engine() -> str:
+    """Engine to use when none is given: $FOCUS_ENGINE if valid, else realtime."""
+    value = os.environ.get("FOCUS_ENGINE", "realtime")
+    return value if value in ENGINE_CHOICES else "realtime"
+
+
+def engine_available(engine: str, cached_only: bool, profile_name: str) -> bool:
+    """Whether a session could start on ``engine`` right now."""
+    if resolve_api_key():
+        return True
+    if engine == "lyria-3.5" and cached_only:
+        from focus.generation.track_library import TrackCache
+
+        return bool(TrackCache(profile_name).tracks())
+    return False
 
 
 @main.command("profiles")
@@ -183,17 +205,33 @@ def show_profiles():
 )
 @click.option(
     "--engine",
-    type=click.Choice(["realtime", "lyria-3.5"]),
+    type=click.Choice(ENGINE_CHOICES),
     default="realtime",
+    envvar="FOCUS_ENGINE",
     show_default=True,
     help="realtime: endless live stream (Lyria RealTime). lyria-3.5: generated "
-    "~2.5 min tracks blended together ($0.08 per track, cached for reuse)",
+    "~2.5 min tracks blended together, reused from a library ($0.08 per new "
+    "track). Default from $FOCUS_ENGINE; press [e] mid-session to switch",
 )
 @click.option(
     "--cached-only",
     is_flag=True,
     default=False,
-    help="With --engine lyria-3.5: replay cached tracks only (no API calls, no cost)",
+    help="With --engine lyria-3.5: replay library tracks only (no API calls, no cost)",
+)
+@click.option(
+    "--max-plays",
+    type=click.IntRange(min=1),
+    default=10,
+    show_default=True,
+    help="Lyria 3.5: retire a library track after this many plays",
+)
+@click.option(
+    "--cooldown-hours",
+    type=click.FloatRange(min=0),
+    default=12.0,
+    show_default=True,
+    help="Lyria 3.5: don't reuse a library track within this many hours of its last play",
 )
 @click.option(
     "--pomodoro",
@@ -241,6 +279,8 @@ def start_session(
     notify: bool,
     engine: str,
     cached_only: bool,
+    max_plays: int,
+    cooldown_hours: float,
 ):
     """Start a focus music session.
 
@@ -277,6 +317,8 @@ def start_session(
         notify=notify,
         engine=engine,
         cached_only=cached_only,
+        max_plays=max_plays,
+        cooldown_hours=cooldown_hours,
     )
 
 
@@ -356,6 +398,8 @@ def launch_session(
     notify: bool = True,
     engine: str = "realtime",
     cached_only: bool = False,
+    max_plays: int = 10,
+    cooldown_hours: float = 12.0,
 ):
     """Resolve a profile, apply overrides, and run a session.
 
@@ -418,8 +462,15 @@ def launch_session(
         )
         click.echo(f"   Prompt: {focus_profile.prompt[:60]}...")
     if engine == "lyria-3.5" and not mock:
-        source = "cached tracks only, no cost" if cached_only else "$0.08 per generated track"
+        source = (
+            "library tracks only, no cost"
+            if cached_only
+            else f"library reuse free, new tracks $0.08; cap {max_plays} plays, "
+            f"{cooldown_hours:g}h cooldown"
+        )
         click.echo(f"   Engine: Lyria 3.5 ({source})")
+    elif not mock:
+        click.echo("   Engine: realtime (press [e] to switch to Lyria 3.5)")
     if duration:
         click.echo(f"   Duration: {duration} seconds")
     if blocks:
@@ -450,6 +501,8 @@ def launch_session(
                 log_session=log_session and not mock,
                 engine=engine,
                 cached_only=cached_only,
+                max_plays=max_plays,
+                cooldown_hours=cooldown_hours,
                 **block,
             )
         )
@@ -524,6 +577,8 @@ async def _run_session(
     log_session: bool = False,
     engine: str = "realtime",
     cached_only: bool = False,
+    max_plays: int = 10,
+    cooldown_hours: float = 12.0,
 ) -> str:
     """Run the audio generation session.
 
@@ -563,8 +618,12 @@ async def _run_session(
             )
         return LyriaConfig(prompt=profile.prompt, bpm=bpm, density=density, brightness=brightness)
 
+    # Mutable so [e] can switch engines mid-session
+    current_engine = engine
+    paid_requests_total = 0
+
     def make_client(phase: str):
-        if engine == "lyria-3.5" and not use_mock:
+        if current_engine == "lyria-3.5" and not use_mock:
             from focus.generation.track_client import TrackClient
 
             return TrackClient(
@@ -573,6 +632,8 @@ async def _run_session(
                 verbose=verbose,
                 cached_only=cached_only,
                 main_prompt=profile.prompt,
+                max_plays=max_plays,
+                cooldown_hours=cooldown_hours,
             )
         return create_client(
             build_config(phase),
@@ -623,6 +684,7 @@ async def _run_session(
             modulation_freq=profile.modulation_freq,
             modulation_depth=profile.modulation_depth,
             status="connecting",
+            engine_label="" if use_mock else engine,
         )
         if not verbose:
             # The live status line and -v logging both want the bottom region;
@@ -894,6 +956,13 @@ async def _run_session(
                         # Track engine: blend into the next queued track in place
                         client.skip()
                         state.skip_requested = False
+                    if state.engine_switch_requested:
+                        target = "lyria-3.5" if current_engine == "realtime" else "realtime"
+                        if use_mock or not engine_available(target, cached_only, profile.name):
+                            state.engine_switch_requested = False  # nothing to switch to
+                        else:
+                            reconnect = True
+                            break
                     if state.paused or state.skip_requested:
                         reconnect = True
                         break
@@ -912,6 +981,21 @@ async def _run_session(
                 break
 
             # Pause: tear the session down (stops burning quota), wait, reconnect
+            if state.engine_switch_requested:
+                # Swap engines in place: same profile and phase, fresh fade-in
+                state.engine_switch_requested = False
+                state.status = "reconnecting"
+                if status_line is not None:
+                    status_line.render(state)
+                paid_requests_total += getattr(client, "paid_requests", 0) or 0
+                await client.stop()
+                current_engine = "lyria-3.5" if current_engine == "realtime" else "realtime"
+                state.engine_label = current_engine
+                client = make_client(current_phase)
+                await client.connect()
+                fade_in_samples_remaining = int(fade_duration * sample_rate)
+                continue
+
             resumable = getattr(client, "resumable", False)
             if state.paused:
                 output.pause()
@@ -997,7 +1081,11 @@ async def _run_session(
                     if use_mock or getattr(client, "using_synth", False)
                     else getattr(client, "engine_name", "lyria")
                 ),
-                paid_requests=getattr(client, "paid_requests", None),
+                paid_requests=(
+                    paid_requests_total + (getattr(client, "paid_requests", 0) or 0)
+                    if current_engine == "lyria-3.5" or paid_requests_total
+                    else None
+                ),
                 modulation_freq=profile.modulation_freq,
                 modulation_depth=profile.modulation_depth,
                 fallback_reason=fallback_reason,
@@ -1042,6 +1130,27 @@ def show_log(days: int, as_json: bool):
         click.echo(json.dumps({"log_path": str(log_path()), **summary}, indent=2))
     else:
         click.echo(format_summary(summary))
+
+
+@main.command("tracks")
+def show_tracks():
+    """Show the Lyria 3.5 track library: tracks, plays and what's retired."""
+    from focus.generation.track_library import TrackCache, cache_root
+
+    root = cache_root()
+    folders = sorted(p for p in root.iterdir() if p.is_dir()) if root.exists() else []
+    click.echo(f"\n🎼 Track library: {root}\n")
+    if not folders:
+        click.echo("  (empty: tracks appear here after a session with --engine lyria-3.5)\n")
+        return
+    for folder in folders:
+        st = TrackCache(folder.name).stats()
+        click.echo(
+            f"  {st['profile']:<14} {st['tracks']:>3} tracks · {st['ready']} ready · "
+            f"{st['cooling_down']} cooling down · {st['retired']} retired · "
+            f"{st['plays']} plays · {st['megabytes']} MB"
+        )
+    click.echo("")
 
 
 @main.command("test-audio")

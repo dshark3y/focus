@@ -12,6 +12,7 @@ fade-in and leaves an audible lull. Instead each track is:
 """
 
 from collections import deque
+from collections.abc import Callable
 
 import numpy as np
 
@@ -109,6 +110,7 @@ class TrackMixer:
         self.sample_rate = sample_rate
         self.overlap_n = int(overlap_seconds * sample_rate)
         self._queue: deque[np.ndarray] = deque()
+        self._callbacks: deque[Callable[[], None] | None] = deque()
         self._current: np.ndarray | None = None
         self._pos = 0
         self._pending_skip = False
@@ -127,17 +129,26 @@ class TrackMixer:
             return 0.0
         return (len(self._current) - self._pos) / self.sample_rate
 
-    def push(self, track: np.ndarray) -> None:
+    def push(self, track: np.ndarray, on_start: Callable[[], None] | None = None) -> None:
+        """Queue a track; ``on_start`` runs when it begins playing (e.g. to count plays)."""
         self._queue.append(track.astype(np.float32, copy=False))
+        self._callbacks.append(on_start)
+
+    def _pop_next(self) -> np.ndarray:
+        track = self._queue.popleft()
+        callback = self._callbacks.popleft()
+        self.tracks_started += 1
+        if callback is not None:
+            callback()
+        return track
 
     def skip(self) -> None:
         """Hand over to the next track quickly (as soon as one is queued)."""
         self._pending_skip = True
 
     def _start_next(self) -> None:
-        self._current = self._queue.popleft()
+        self._current = self._pop_next()
         self._pos = 0
-        self.tracks_started += 1
         if self._resume_fade:  # coming back from silence: don't start abruptly
             n = min(len(self._current), int(RESUME_FADE_SECONDS * self.sample_rate))
             self._current = self._current.copy()
@@ -162,12 +173,11 @@ class TrackMixer:
         ov = min(ov, len(nxt))
         if ov <= 0:
             return
-        self._queue.popleft()
+        self._pop_next()
         g_out, g_in = overlap_gains(ov)
         blended = cur[self._pos : self._pos + ov] * g_out[:, None] + nxt[:ov] * g_in[:, None]
         self._current = np.concatenate([blended, nxt[ov:]]).astype(np.float32)
         self._pos = 0
-        self.tracks_started += 1
 
     def read(self, n: int) -> np.ndarray:
         parts = []

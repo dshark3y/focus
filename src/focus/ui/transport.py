@@ -37,6 +37,7 @@ class PlaybackState:
     # Control flags (set by the keyboard reader, consumed by the audio loop)
     paused: bool = False
     skip_requested: bool = False
+    engine_switch_requested: bool = False
     quit_requested: bool = False
     show_help: bool = False
     volume: float = 1.0
@@ -48,6 +49,7 @@ class PlaybackState:
     elapsed_seconds: float = 0.0
     buffer_seconds: float = 0.0
     status: str = "connecting"  # connecting | playing | paused | reconnecting
+    engine_label: str = ""  # e.g. "realtime" or "lyria-3.5"
 
     def toggle_pause(self) -> None:
         self.paused = not self.paused
@@ -64,6 +66,8 @@ class PlaybackState:
             self.toggle_pause()
         elif data in (b"n", b"N"):
             self.skip_requested = True
+        elif data in (b"e", b"E"):
+            self.engine_switch_requested = True
         elif data in (b"q", b"Q"):
             self.quit_requested = True
         elif data == b"?":
@@ -202,14 +206,15 @@ def format_status_line(s: PlaybackState) -> str:
     vol = f"{int(round(s.volume * 100))}%"
     info = (
         f"♫ {s.profile_name} · {s.modulation_freq:.0f}Hz @ {s.modulation_depth:.0%}"
-        f"   {token}   {_format_time(s.elapsed_seconds)}"
+        + (f" · {s.engine_label}" if s.engine_label else "")
+        + f"   {token}   {_format_time(s.elapsed_seconds)}"
         f"   vol {vol}   buf {s.buffer_seconds:.1f}s"
     )
     if s.show_help:
         hints = (
-            "[space/p] pause  [n] next take  [↑↓ or +/-] volume  "
+            "[space/p] pause  [n] next take/track  [e] switch engine  [↑↓ or +/-] volume  "
             "[?] hide help  [q] quit  [Ctrl+C] stop"
         )
     else:
-        hints = "[space] pause  [n] next  [↑↓] volume  [?] help  [q] quit"
+        hints = "[space] pause  [n] next  [e] engine  [↑↓] volume  [?] help  [q] quit"
     return f"{info}   ·   {hints}"

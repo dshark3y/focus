@@ -186,7 +186,12 @@ class TestTrackClient:
         client._running = True
         client._client = SimpleNamespace(aio=SimpleNamespace(interactions=fake))
         asyncio.run(collect(client, 1.0))
-        assert "emerging" not in fake.prompts[2] and "Dark ambient" in fake.prompts[2]
+        # The profile's main prompt (without the phase wording) is tried before the generic one
+        main_tries = [
+            i for i, p in enumerate(fake.prompts) if "Dark ambient" in p and "emerging" not in p
+        ]
+        generic = [i for i, p in enumerate(fake.prompts) if "Calm, steady" in p]
+        assert main_tries and (not generic or main_tries[0] < generic[0])
 
     def test_refused_wav_format_falls_back_to_default_format(self, tmp_path):
         fake = FakeInteractions(
@@ -222,3 +227,83 @@ class TestTrackClient:
         cache.save(big, "a")
         newest = cache.save(big, "b")
         assert cache.tracks() == [newest]  # oldest pruned, the one just saved kept
+
+
+class TestTrackLibrary:
+    def _lib(self, tmp_path, n=3, **kw):
+        lib = TrackCache("deep-work", root=tmp_path, **kw)
+        paths = [lib.save(wav_bytes(tone(1, sr=48000), 48000), f"p{i}") for i in range(n)]
+        return lib, paths
+
+    def test_record_play_counts_and_retires_at_cap(self, tmp_path):
+        lib, (a, *_) = self._lib(tmp_path, n=1, max_plays=2, cooldown_hours=0)
+        lib.record_play(a)
+        assert lib.plays(a) == 1 and not lib.retired(a)
+        lib.record_play(a)
+        assert lib.retired(a)
+        assert lib.pick() is None  # retired tracks are never reused
+
+    def test_cooldown_blocks_recent_tracks(self, tmp_path):
+        lib, (a, b, c) = self._lib(tmp_path, cooldown_hours=12)
+        lib.record_play(a)
+        lib.record_play(b)
+        assert lib.pick() == c
+        lib.record_play(c)
+        assert lib.pick() is None  # everything played within 12 h
+
+    def test_prefers_least_played(self, tmp_path):
+        lib, (a, b, c) = self._lib(tmp_path, cooldown_hours=0)
+        for t in (a, a, b):
+            lib.record_play(t)
+        assert lib.pick() == c
+
+    def test_relaxed_pick_ignores_cap_and_takes_longest_unplayed(self, tmp_path):
+        lib, (a, b) = self._lib(tmp_path, n=2, max_plays=1, cooldown_hours=12)
+        lib.record_play(a)
+        lib.record_play(b)
+        assert lib.pick() is None
+        assert lib.pick(relaxed=True) == a
+
+    def test_prune_removes_retired_before_newer_tracks(self, tmp_path):
+        big = wav_bytes(tone(8, sr=48000), 48000)  # ~1.5 MB
+        lib = TrackCache("deep-work", root=tmp_path, max_mb=3, max_plays=1)
+        old = lib.save(big, "old")
+        retired = lib.save(big, "retired")
+        lib.record_play(retired)
+        newest = lib.save(big, "new")
+        assert set(lib.tracks()) == {old, newest}
+
+    def test_stats(self, tmp_path):
+        lib, (a, b, c) = self._lib(tmp_path, max_plays=1, cooldown_hours=12)
+        lib.record_play(a)
+        st = lib.stats()
+        assert (st["tracks"], st["retired"], st["ready"], st["plays"]) == (3, 1, 2, 1)
+
+
+class TestReuseInEngine:
+    def test_reuses_library_instead_of_paying(self, tmp_path):
+        lib = TrackCache("deep-work", root=tmp_path)
+        for i in range(3):
+            lib.save(wav_bytes(tone(12, sr=48000), 48000), f"p{i}")
+        fake = FakeInteractions()
+        client = make_client(tmp_path, fake)
+        asyncio.run(collect(client, 15.0))
+        assert client.paid_requests == 0
+        assert client.reused_tracks >= 2
+        assert sum(lib.plays(t) for t in lib.tracks()) == client.reused_tracks
+
+    def test_generates_when_library_is_cooling_down(self, tmp_path):
+        lib = TrackCache("deep-work", root=tmp_path)
+        lib.record_play(lib.save(wav_bytes(tone(12, sr=48000), 48000), "p"))
+        fake = FakeInteractions()
+        client = make_client(tmp_path, fake)
+        asyncio.run(collect(client, 1.0))
+        assert client.paid_requests >= 1
+
+    def test_queued_but_unplayed_track_is_not_counted(self):
+        mixer = TrackMixer(SR, overlap_seconds=1.0)
+        started = []
+        mixer.push(tone(5), on_start=lambda: started.append("a"))
+        mixer.push(tone(5), on_start=lambda: started.append("b"))
+        mixer.read(SR)
+        assert started == ["a"]

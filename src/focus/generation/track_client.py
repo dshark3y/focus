@@ -6,23 +6,21 @@ ahead of playback, blends tracks with :class:`TrackMixer`, and exposes the same
 ``connect`` / ``generate_stream`` / ``set_prompt`` / ``stop`` interface as the
 real-time client so the CLI pipeline is unchanged.
 
-Every generated track is cached on disk. A session starts instantly from the
-cache when it has tracks for the profile, and ``cached_only`` replays the cache
-without making any paid requests.
+Every generated track is kept in a :class:`TrackCache` library and reused
+while it has fewer than 10 plays and hasn't played in the last 12 hours; a new
+track is generated only when nothing qualifies. ``cached_only`` replays the
+library without making any paid requests.
 """
 
 import asyncio
 import base64
 import io
-import json
-import os
 import random
 import shutil
 import subprocess
 import time
 import warnings
 from collections import deque
-from datetime import datetime
 from math import gcd
 from pathlib import Path
 
@@ -34,6 +32,12 @@ from focus.generation.lyria_client import (
     _short_reason,
     resolve_api_key,
 )
+from focus.generation.track_library import (  # noqa: F401  (re-exported)
+    DEFAULT_COOLDOWN_HOURS,
+    DEFAULT_MAX_PLAYS,
+    TrackCache,
+    cache_root,
+)
 from focus.generation.track_mix import TrackMixer, prepare_track
 
 MODEL = "lyria-3.5"
@@ -42,8 +46,7 @@ PREFETCH_TRACKS = 1  # tracks kept ready beyond the one playing
 LEAD_SECONDS = 4.0  # how far ahead of real time the stream may run (see synth)
 CHUNK_SECONDS = 0.2
 MAX_ATTEMPTS = 5
-RECENT_TRACKS = 5  # cached tracks not to repeat back to back
-DEFAULT_CACHE_MB = 1024
+RECENT_TRACKS = 5  # in-session guard on top of the library cooldown
 
 # Neutral, filter-safe ways to vary consecutive tracks. Brand or instrument
 # names (e.g. "Rhodes") have tripped the content filter, so keep these plain.
@@ -69,19 +72,6 @@ def build_track_prompt(base_prompt: str, bpm: int, variation: str = "") -> str:
     if variation:
         parts.append(variation)
     return " ".join(parts)
-
-
-def cache_root() -> Path:
-    """Track cache: $FOCUS_CACHE_DIR, else $XDG_CACHE_HOME/focus/tracks, else ~/.cache."""
-    override = os.environ.get("FOCUS_CACHE_DIR")
-    if override:
-        return Path(override).expanduser()
-    base = os.environ.get("XDG_CACHE_HOME") or "~/.cache"
-    return Path(base).expanduser() / "focus" / "tracks"
-
-
-def _slug(name: str) -> str:
-    return "".join(c if c.isalnum() or c in "-_" else "-" for c in name.lower()) or "default"
 
 
 def decode_audio(data: bytes, sample_rate: int) -> np.ndarray:
@@ -118,56 +108,6 @@ def decode_audio(data: bytes, sample_rate: int) -> np.ndarray:
     return audio
 
 
-class TrackCache:
-    """Generated tracks on disk, one folder per profile, capped by total size."""
-
-    def __init__(self, profile: str, root: Path | None = None, max_mb: int | None = None):
-        self.root = root or cache_root()
-        self.dir = self.root / _slug(profile)
-        env_mb = os.environ.get("FOCUS_CACHE_MAX_MB")
-        self.max_bytes = int(max_mb or (int(env_mb) if env_mb else DEFAULT_CACHE_MB)) * 1024**2
-
-    def tracks(self) -> list[Path]:
-        if not self.dir.exists():
-            return []
-        return sorted(p for p in self.dir.iterdir() if p.suffix in (".wav", ".mp3"))
-
-    def save(self, data: bytes, prompt: str) -> Path | None:
-        """Store a track (best-effort); returns its path or None on failure."""
-        try:
-            self.dir.mkdir(parents=True, exist_ok=True)
-            stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-            path = self.dir / f"{stamp}.{'wav' if data[:4] == b'RIFF' else 'mp3'}"
-            path.write_bytes(data)
-            meta = {"model": MODEL, "prompt": prompt, "created": stamp}
-            path.with_suffix(".json").write_text(json.dumps(meta))
-            self._prune(keep=path)
-            return path
-        except OSError:
-            return None
-
-    def _prune(self, keep: Path) -> None:
-        """Delete the oldest tracks (across profiles) beyond the size cap, never ``keep``."""
-        files = sorted(
-            (p for p in self.root.glob("*/*") if p.suffix in (".wav", ".mp3") and p != keep),
-            key=lambda p: p.stat().st_mtime,
-        )
-        total = keep.stat().st_size + sum(p.stat().st_size for p in files)
-        for p in files:
-            if total <= self.max_bytes:
-                break
-            total -= p.stat().st_size
-            p.unlink(missing_ok=True)
-            p.with_suffix(".json").unlink(missing_ok=True)
-
-    def pick(self, avoid: set[Path]) -> Path | None:
-        """A random cached track, avoiding recently played ones when possible."""
-        tracks = self.tracks()
-        fresh = [p for p in tracks if p not in avoid]
-        pool = fresh or tracks
-        return random.choice(pool) if pool else None
-
-
 class TrackClient:
     """Lyria 3.5 engine with ahead-of-time generation, blending and caching."""
 
@@ -182,13 +122,18 @@ class TrackClient:
         cached_only: bool = False,
         cache: TrackCache | None = None,
         main_prompt: str | None = None,
+        max_plays: int = DEFAULT_MAX_PLAYS,
+        cooldown_hours: float = DEFAULT_COOLDOWN_HOURS,
     ):
         self.config = config
         self.verbose = verbose
         self.cached_only = cached_only
-        self.cache = cache or TrackCache(profile)
+        self.cache = cache or TrackCache(
+            profile, max_plays=max_plays, cooldown_hours=cooldown_hours
+        )
         self.fallback_reason: str | None = None
         self.paid_requests = 0  # successful generations (what gets billed)
+        self.reused_tracks = 0  # library tracks that started playing
         self.status: str = "starting"
         self._prompt = config.prompt
         # The profile's plain prompt, used if a phase-modified prompt is blocked
@@ -198,6 +143,7 @@ class TrackClient:
         self._mixer = TrackMixer(config.sample_rate)
         self._producer: asyncio.Task | None = None
         self._recent: deque[Path] = deque(maxlen=RECENT_TRACKS)
+        self._pending: set[Path] = set()  # picked/queued but not yet playing
         self._variation = random.randrange(len(VARIATIONS))
         # 0 = request WAV (decoded without ffmpeg), 1 = the default MP3
         self._format_level = 0
@@ -292,47 +238,68 @@ class TrackClient:
             if self._mixer.queued >= PREFETCH_TRACKS:
                 await asyncio.sleep(0.5)
                 continue
-            audio = await self._next_track(first)
-            if audio is None:
+            picked = await self._next_track()
+            if picked is None:
                 return
-            self._mixer.push(prepare_track(audio, self.config.sample_rate, trim_intro=not first))
+            audio, path, reused = picked
+            self._mixer.push(
+                prepare_track(audio, self.config.sample_rate, trim_intro=not first),
+                on_start=lambda p=path, r=reused: self._on_track_start(p, r),
+            )
             first = False
 
-    async def _next_track(self, first: bool) -> np.ndarray | None:
-        """Next track's audio: cache on start / cached-only, else a new generation."""
-        use_cache = self.cached_only or (first and self.cache.tracks())
-        if use_cache:
-            audio = self._load_cached()
-            if audio is not None:
-                return audio
+    def _on_track_start(self, path: Path | None, reused: bool) -> None:
+        """A queued track began playing: count the play in the library."""
+        if path is None:
+            return
+        self._pending.discard(path)
+        self._recent.append(path)
+        self.cache.record_play(path)
+        if reused:
+            self.reused_tracks += 1
+
+    async def _next_track(self) -> tuple[np.ndarray, Path | None, bool] | None:
+        """Next track as (audio, library path, reused?), or None to stop.
+
+        Reuse a library track when one qualifies (under the play cap and out of
+        cooldown); otherwise generate a new one. If generation fails for good,
+        keep going on the library (cap and cooldown relaxed), else the synth.
+        """
+        reused = self._load_cached(relaxed=False)
+        if reused is not None:
+            return reused
         if self.cached_only:
-            return None
-        audio = await self._generate()
-        if audio is not None:
-            return audio
-        # Generation failed for good: keep playing from the cache if we can
-        cached = self._load_cached()
-        if cached is not None:
+            return self._load_cached(relaxed=True)
+        generated = await self._generate()
+        if generated is not None:
+            return generated
+        fallback = self._load_cached(relaxed=True)
+        if fallback is not None:
             self.cached_only = True
-            return cached
+            return fallback
         self._synth = EnhancedSynthClient(self.config, verbose=self.verbose)
         await self._synth.connect()
         return None
 
-    def _load_cached(self) -> np.ndarray | None:
-        path = self.cache.pick(set(self._recent))
-        if path is None:
-            return None
-        try:
-            audio = decode_audio(path.read_bytes(), self.config.sample_rate)
-        except Exception:
-            return None
-        self._recent.append(path)
-        if self.verbose:
-            print(f"   [Lyria 3.5] Playing cached track {path.name}")
-        return audio
+    def _load_cached(self, relaxed: bool) -> tuple[np.ndarray, Path, bool] | None:
+        avoid = set(self._recent) | self._pending
+        for _ in range(3):  # skip over unreadable files
+            path = self.cache.pick(avoid, relaxed=relaxed)
+            if path is None:
+                return None
+            try:
+                audio = decode_audio(path.read_bytes(), self.config.sample_rate)
+            except Exception:
+                avoid.add(path)
+                continue
+            self._pending.add(path)
+            if self.verbose:
+                plays = self.cache.plays(path)
+                print(f"   [Lyria 3.5] Reusing {path.name} (played {plays}x)")
+            return audio, path, True
+        return None
 
-    async def _generate(self) -> np.ndarray | None:
+    async def _generate(self) -> tuple[np.ndarray, Path | None, bool] | None:
         """Generate one track, retrying transient errors and rewording blocked prompts."""
         variation = VARIATIONS[self._variation % len(VARIATIONS)]
         self._variation += 1
@@ -379,13 +346,15 @@ class TrackClient:
                 continue
             self.paid_requests += 1
             self.fallback_reason = None
-            self.cache.save(data, prompt)
+            path = self.cache.save(data, prompt)
+            if path is not None:
+                self._pending.add(path)
             if self.verbose:
                 took = time.monotonic() - started
                 length = len(audio) / self.config.sample_rate
                 n = self.paid_requests
                 print(f"   [Lyria 3.5] Track {n} ready in {took:.0f}s ({length:.0f}s long)")
-            return audio
+            return audio, path, False
         if self.fallback_reason is None:
             self.fallback_reason = "prompt blocked by content filter"
         return None
