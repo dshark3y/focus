@@ -412,58 +412,54 @@ class MockAudioOutput:
 
 @dataclass
 class FileAudioOutput:
-    """Audio output to a WAV file.
+    """Audio output to a 16-bit PCM WAV file.
 
-    Collects audio chunks and writes them to a WAV file when stopped.
+    Streams each chunk to disk as it arrives, so memory stays flat however long
+    the session runs (buffering a full hour in RAM would take ~1.4 GB).
     """
 
     filepath: str
     sample_rate: int = 48000
     channels: int = 2
 
-    _buffer: list = field(default_factory=list, init=False, repr=False)
+    _wav: object = field(default=None, init=False, repr=False)
     _running: bool = field(default=False, init=False)
 
     def start(self) -> None:
-        """Start collecting audio."""
+        """Open the WAV file for writing."""
+        import wave
+
+        self._wav = wave.open(self.filepath, "wb")
+        self._wav.setnchannels(self.channels)
+        self._wav.setsampwidth(2)
+        self._wav.setframerate(self.sample_rate)
         self._running = True
-        self._buffer = []
 
     def write(self, audio: np.ndarray) -> None:
-        """Add audio data to the buffer.
+        """Append audio to the file.
 
         Args:
-            audio: Audio data, shape (samples,) or (samples, channels).
+            audio: Audio data, shape (samples,) or (samples, channels), float in [-1, 1].
         """
-        if self._running:
-            self._buffer.append(audio.copy())
+        if not self._running or self._wav is None:
+            return
+        if audio.ndim == 1 and self.channels == 2:
+            audio = np.column_stack([audio, audio])
+        # Clip before converting so out-of-range peaks (e.g. --no-limiter)
+        # saturate instead of wrapping around into loud clicks.
+        pcm = (np.clip(audio, -1.0, 1.0) * 32767.0).astype("<i2")
+        self._wav.writeframes(pcm.tobytes())
 
     def flush(self) -> None:
-        """No-op for file output (all data is buffered anyway)."""
+        """No-op: frames are written as they arrive."""
         pass
 
     def stop(self) -> None:
-        """Stop collecting and write to WAV file."""
+        """Finalize the WAV header and close the file."""
         self._running = False
-        if not self._buffer:
-            return
-
-        try:
-            from scipy.io import wavfile
-        except ImportError:
-            raise ImportError("scipy is required for file output. Install with: pip install scipy")
-
-        # Concatenate all chunks
-        full_audio = np.concatenate(self._buffer, axis=0)
-
-        # Convert to int16 for WAV
-        audio_int16 = (full_audio * 32767).astype(np.int16)
-
-        # Write to file
-        wavfile.write(self.filepath, self.sample_rate, audio_int16)
-
-        # Clear buffer
-        self._buffer = []
+        if self._wav is not None:
+            self._wav.close()
+            self._wav = None
 
     def __enter__(self):
         self.start()

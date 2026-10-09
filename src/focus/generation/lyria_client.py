@@ -29,6 +29,11 @@ OVERLAP_SECONDS = 8.0
 CROSSFADE_DURATION_SECONDS = 4.0
 WARMUP_MIN_SECONDS = 1.5  # Buffered new-session audio before crossfading
 
+# How far the fallback synth may run ahead of real time. Must exceed the
+# output prebuffer (AudioOutput.minimum_buffer_seconds = 3s) and stay under
+# its queue capacity (~8.5s) so nothing is dropped.
+SYNTH_LEAD_SECONDS = 4.0
+
 
 # Fraction of the crossfade window over which the OUTGOING track fades to
 # silence. Keeping this below 1.0 makes the last part of the crossfade the
@@ -275,6 +280,9 @@ class LyriaClient:
     _running: bool = field(default=False, init=False)
     _session_count: int = field(default=0, init=False, repr=False)
     verbose: bool = field(default=False, init=True)
+    # Set when Lyria could not be reached and playback fell back to the synth,
+    # so the UI can tell the listener why they are hearing a drone.
+    fallback_reason: str | None = field(default=None, init=False)
 
     def __post_init__(self):
         if not GENAI_AVAILABLE:
@@ -286,12 +294,13 @@ class LyriaClient:
         """Initialize connection to Lyria RealTime API.
 
         Args:
-            api_key: Google API key. If not provided, uses GOOGLE_API_KEY env var.
+            api_key: Google API key. If not provided, uses the GOOGLE_API_KEY
+                or GEMINI_API_KEY env var.
         """
-        api_key = api_key or os.environ.get("GOOGLE_API_KEY")
+        api_key = api_key or resolve_api_key()
         if not api_key:
             raise ValueError(
-                "API key required. Set GOOGLE_API_KEY environment variable or pass api_key."
+                "API key required. Set GOOGLE_API_KEY (or GEMINI_API_KEY) or pass api_key."
             )
 
         # Initialize client with v1alpha API version required for Lyria
@@ -330,6 +339,7 @@ class LyriaClient:
 
                 # Non-retryable: model not found -> fall back to synth
                 if "404" in error_msg or "not found" in error_msg.lower():
+                    self.fallback_reason = _short_reason(error_msg)
                     if self.verbose:
                         print(f"   ⚠️  Lyria model unreachable ({error_msg})")
                         print("   🔄 Falling back to Enhanced Synth engine...")
@@ -356,6 +366,7 @@ class LyriaClient:
                     await asyncio.sleep(delay)
                     continue
 
+                self.fallback_reason = _short_reason(error_msg)
                 if self.verbose:
                     if retry_count >= max_retries:
                         print(f"   ❌ Lyria retries exhausted after {max_retries} attempts")
@@ -562,6 +573,7 @@ class EnhancedSynthClient:
         self.verbose = verbose
         self._running = False
         self._phase = 0.0
+        self._t0: float | None = None
 
         # Stereo delay buffer for click-free stereo widening
         delay_samples = int(0.02 * config.sample_rate)  # 20ms delay
@@ -581,6 +593,7 @@ class EnhancedSynthClient:
     async def connect(self, api_key: str | None = None) -> None:
         """Initialize synth."""
         self._running = True
+        self._t0 = None
         # Reset delay buffer on connect
         delay_samples = int(0.02 * self.config.sample_rate)
         self._delay_buffer = np.zeros(delay_samples, dtype=np.float32)
@@ -628,9 +641,14 @@ class EnhancedSynthClient:
 
             yield stereo.astype(np.float32)
 
-            # Allow other tasks to run, but don't sleep for duration
-            # The output stream blocking write provides the backpressure
-            await asyncio.sleep(0)
+            # Pace to real time. AudioOutput.write() never blocks (it drops the
+            # oldest block when full), so without this the synth races ahead,
+            # most of its audio is discarded and timed sessions end in about a
+            # second. Stay SYNTH_LEAD_SECONDS ahead so the prebuffer still fills.
+            if self._t0 is None:
+                self._t0 = time.monotonic()
+            ahead = self._phase - (time.monotonic() - self._t0)
+            await asyncio.sleep(max(0.0, ahead - SYNTH_LEAD_SECONDS))
 
     async def stop(self) -> None:
         self._running = False
@@ -638,6 +656,18 @@ class EnhancedSynthClient:
     async def set_prompt(self, new_prompt: str) -> None:
         """Change prompt (no-op for synth, included for API compatibility)."""
         pass  # Synth doesn't support dynamic prompt changes
+
+
+def resolve_api_key() -> str | None:
+    """Return the API key from GOOGLE_API_KEY, falling back to GEMINI_API_KEY."""
+    return os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+
+
+def _short_reason(error_msg: str, limit: int = 80) -> str:
+    """First line of an error message, trimmed for a one-line status display."""
+    text = error_msg.strip()
+    line = text.splitlines()[0] if text else "unknown error"
+    return line if len(line) <= limit else f"{line[: limit - 1]}…"
 
 
 def create_client(

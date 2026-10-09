@@ -2,13 +2,14 @@
 
 import asyncio
 import sys
+from dataclasses import replace
 
 import click
 
 from focus.dsp.dynamics import LimiterState, apply_limiter
 from focus.dsp.entrainment import ModulationState, apply_entrainment, apply_fade_out
 from focus.dsp.spatial import ReverbState, apply_reverb, apply_stereo_widening
-from focus.generation.lyria_client import LyriaConfig, create_client
+from focus.generation.lyria_client import LyriaConfig, create_client, resolve_api_key
 from focus.profiles import FocusProfile, get_profile, list_profiles
 from focus.ui.transport import KeyboardController, PlaybackState, StatusLine
 
@@ -86,16 +87,16 @@ def show_profiles():
 @click.option(
     "--frequency",
     "-f",
-    type=float,
+    type=click.FloatRange(min=0.0, max=100.0, min_open=True),
     default=None,
     help="Override modulation frequency (Hz)",
 )
 @click.option(
     "--depth",
     "-d",
-    type=float,
+    type=click.FloatRange(min=0.0, max=1.0),
     default=None,
-    help="Override modulation depth (0.0-1.0)",
+    help="Override modulation depth (0.0-1.0; 0 turns modulation off)",
 )
 @click.option(
     "--band",
@@ -209,6 +210,32 @@ def start_session(
     )
 
 
+def apply_overrides(
+    profile: FocusProfile,
+    frequency: float | None = None,
+    depth: float | None = None,
+    band: float | None = None,
+    prompt: str | None = None,
+) -> FocusProfile:
+    """Return ``profile`` with any CLI overrides applied.
+
+    Compares to None so explicit zeros apply (``--depth 0`` turns modulation
+    off), and uses ``replace`` so untouched fields such as the intro/outro
+    prompts survive.
+    """
+    changes: dict = {}
+    if frequency is not None:
+        changes["modulation_freq"] = frequency
+    if depth is not None:
+        changes["modulation_depth"] = depth
+    if band is not None:
+        # 0 (or negative) disables band-limiting -> full-spectrum modulation
+        changes["modulation_band_hz"] = None if band <= 0 else band
+    if prompt:
+        changes["prompt"] = prompt
+    return replace(profile, **changes) if changes else profile
+
+
 def launch_session(
     profile: str,
     frequency: float | None = None,
@@ -243,24 +270,16 @@ def launch_session(
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
 
-    # Apply overrides
-    if frequency or depth or band is not None or prompt:
-        if band is None:
-            band_hz = focus_profile.modulation_band_hz
-        else:
-            # 0 (or negative) disables band-limiting -> full-spectrum modulation
-            band_hz = None if band <= 0 else band
-        focus_profile = FocusProfile(
-            name=focus_profile.name,
-            description=focus_profile.description,
-            prompt=prompt or focus_profile.prompt,
-            modulation_freq=frequency or focus_profile.modulation_freq,
-            modulation_depth=depth or focus_profile.modulation_depth,
-            modulation_band_hz=band_hz,
-            bpm=focus_profile.bpm,
-            density=focus_profile.density,
-            brightness=focus_profile.brightness,
+    # Fail fast, before the terminal is put into key-reading mode
+    if not mock and not resolve_api_key():
+        click.echo(
+            "Error: no API key. Set GOOGLE_API_KEY (or GEMINI_API_KEY), "
+            "or use --mock to try it without one.",
+            err=True,
         )
+        sys.exit(1)
+
+    focus_profile = apply_overrides(focus_profile, frequency, depth, band, prompt)
 
     click.echo(f"\n🎯 Starting focus session: {click.style(focus_profile.name, bold=True)}")
     click.echo(
@@ -379,6 +398,15 @@ async def _run_session(
         await client.stop()
         return
 
+    current_phase = "intro" if duration and profile.intro_prompt else "main"
+
+    # Connect to generator before touching the terminal, so a connection error
+    # can't leave it in cbreak mode with the display half drawn.
+    client = make_client(current_phase)
+    await client.connect()
+    if verbose:
+        click.echo("   ✓ Connected to audio generator")
+
     # Interactive transport controls (only attached to a real terminal)
     interactive = sys.stdin.isatty() and sys.stdout.isatty()
     state = None
@@ -450,7 +478,6 @@ async def _run_session(
     # Phases: intro -> main -> outro
     intro_duration = 15.0  # seconds for buildup phase
     outro_duration = 30.0  # seconds for wind-down phase
-    current_phase = "intro" if duration and profile.intro_prompt else "main"
     phase_switched_to_main = current_phase == "main"
     phase_switched_to_outro = False
 
@@ -461,12 +488,6 @@ async def _run_session(
                 f"   🎵 Musical phases: intro ({intro_duration}s) → "
                 f"main → outro ({outro_duration}s)"
             )
-
-    # Connect to generator
-    client = make_client(current_phase)
-    await client.connect()
-    if verbose:
-        click.echo("   ✓ Connected to audio generator")
 
     # Use queue-based output for robust playback
     output = AudioOutput(sample_rate=sample_rate)
@@ -479,6 +500,7 @@ async def _run_session(
         file_output.start()
 
     session_complete = False
+    session_error: Exception | None = None
 
     try:
         # Drive the spectrum redraw at a fixed frame rate, decoupled from the
@@ -652,7 +674,9 @@ async def _run_session(
                 if state is not None:
                     state.elapsed_seconds = total_seconds
                     state.buffer_seconds = output.buffer_seconds
-                    state.status = "playing"
+                    state.status = (
+                        "synth fallback" if getattr(client, "fallback_reason", None) else "playing"
+                    )
                     if status_line is not None:
                         status_line.render(state)
                     if state.quit_requested:
@@ -704,8 +728,8 @@ async def _run_session(
     except asyncio.CancelledError:
         pass
     except Exception as e:
+        session_error = e
         if verbose:
-            click.echo(f"   ⚠️  Session error: {e}")
             import traceback
 
             traceback.print_exc()
@@ -735,6 +759,16 @@ async def _run_session(
         if file_output:
             file_output.stop()
         await client.stop()
+        # Reported after the terminal is restored so the message stays readable
+        if session_error is not None:
+            click.echo(f"   ⚠️  Session error: {session_error}", err=True)
+        fallback_reason = getattr(client, "fallback_reason", None)
+        if fallback_reason:
+            click.echo(
+                f"   ⚠️  Lyria was unavailable ({fallback_reason}); "
+                "played the fallback synth instead.",
+                err=True,
+            )
         if verbose:
             buffer_info = f", buffer={output.buffer_seconds:.1f}s"
             underrun_msg = (
