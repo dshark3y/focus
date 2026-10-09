@@ -76,7 +76,7 @@ def main(ctx):
         click.echo(ctx.get_help())
 
 
-ENGINE_CHOICES = ("realtime", "lyria-3.5")
+ENGINE_CHOICES = ("realtime", "lyria-3.5", "offline")
 
 
 def default_engine() -> str:
@@ -85,15 +85,28 @@ def default_engine() -> str:
     return value if value in ENGINE_CHOICES else "realtime"
 
 
-def engine_available(engine: str, cached_only: bool, profile_name: str) -> bool:
-    """Whether a session could start on ``engine`` right now."""
-    if resolve_api_key():
-        return True
-    if engine == "lyria-3.5" and cached_only:
-        from focus.generation.track_library import TrackCache
+def library_available(profile_name: str) -> bool:
+    """Whether offline mode has anything to play (this profile, else any profile)."""
+    from focus.generation.track_library import TrackCache
 
-        return bool(TrackCache(profile_name).tracks())
-    return False
+    return bool(TrackCache(profile_name).tracks() or TrackCache(None).tracks())
+
+
+def engine_available(engine: str, profile_name: str) -> bool:
+    """Whether a session could run on ``engine`` right now."""
+    if engine == "offline":
+        return library_available(profile_name)
+    return resolve_api_key() is not None
+
+
+def next_engine(current: str, profile_name: str) -> str | None:
+    """The engine [e] switches to: the next available one in ENGINE_CHOICES order."""
+    i = ENGINE_CHOICES.index(current)
+    for step in range(1, len(ENGINE_CHOICES)):
+        candidate = ENGINE_CHOICES[(i + step) % len(ENGINE_CHOICES)]
+        if engine_available(candidate, profile_name):
+            return candidate
+    return None
 
 
 @main.command("profiles")
@@ -211,13 +224,17 @@ def show_profiles():
     show_default=True,
     help="realtime: endless live stream (Lyria RealTime). lyria-3.5: generated "
     "~2.5 min tracks blended together, reused from a library ($0.08 per new "
-    "track). Default from $FOCUS_ENGINE; press [e] mid-session to switch",
+    "track). offline: saved tracks only, no network. Default from $FOCUS_ENGINE; "
+    "press [e] mid-session to switch",
 )
 @click.option(
+    "--offline",
     "--cached-only",
+    "offline",
     is_flag=True,
     default=False,
-    help="With --engine lyria-3.5: replay library tracks only (no API calls, no cost)",
+    help="Same as --engine offline: play saved tracks only, ignoring the play cap "
+    "and cooldown (no network, no cost, plays don't count toward the cap)",
 )
 @click.option(
     "--max-plays",
@@ -278,7 +295,7 @@ def start_session(
     log_session: bool,
     notify: bool,
     engine: str,
-    cached_only: bool,
+    offline: bool,
     max_plays: int,
     cooldown_hours: float,
 ):
@@ -315,8 +332,7 @@ def start_session(
         cycles=cycles,
         log_session=log_session,
         notify=notify,
-        engine=engine,
-        cached_only=cached_only,
+        engine="offline" if offline else engine,
         max_plays=max_plays,
         cooldown_hours=cooldown_hours,
     )
@@ -397,7 +413,6 @@ def launch_session(
     log_session: bool = True,
     notify: bool = True,
     engine: str = "realtime",
-    cached_only: bool = False,
     max_plays: int = 10,
     cooldown_hours: float = 12.0,
 ):
@@ -431,12 +446,16 @@ def launch_session(
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
 
-    if cached_only and engine != "lyria-3.5":
-        click.echo("Error: --cached-only needs --engine lyria-3.5.", err=True)
+    if engine == "offline" and not mock and not library_available(profile):
+        click.echo(
+            "Error: no saved tracks for offline mode yet. Play some sessions with "
+            "--engine lyria-3.5 first.",
+            err=True,
+        )
         sys.exit(1)
 
     # Fail fast, before the terminal is put into key-reading mode
-    if not mock and not cached_only and not resolve_api_key():
+    if not mock and engine != "offline" and not resolve_api_key():
         click.echo(
             "Error: no API key. Set GOOGLE_API_KEY (or GEMINI_API_KEY), "
             "or use --mock to try it without one.",
@@ -461,16 +480,17 @@ def launch_session(
             f"Brightness: {focus_profile.brightness}"
         )
         click.echo(f"   Prompt: {focus_profile.prompt[:60]}...")
-    if engine == "lyria-3.5" and not mock:
-        source = (
-            "library tracks only, no cost"
-            if cached_only
-            else f"library reuse free, new tracks $0.08; cap {max_plays} plays, "
-            f"{cooldown_hours:g}h cooldown"
+    if mock:
+        pass
+    elif engine == "offline":
+        click.echo("   Engine: offline (saved tracks, no network, no cost)")
+    elif engine == "lyria-3.5":
+        click.echo(
+            f"   Engine: Lyria 3.5 (library reuse free, new tracks $0.08; "
+            f"cap {max_plays} plays, {cooldown_hours:g}h cooldown)"
         )
-        click.echo(f"   Engine: Lyria 3.5 ({source})")
-    elif not mock:
-        click.echo("   Engine: realtime (press [e] to switch to Lyria 3.5)")
+    else:
+        click.echo("   Engine: realtime (falls back to saved tracks if the connection drops)")
     if duration:
         click.echo(f"   Duration: {duration} seconds")
     if blocks:
@@ -503,7 +523,6 @@ def launch_session(
                 spectrum=spectrum,
                 log_session=log_session and not mock,
                 engine=engine,
-                cached_only=cached_only,
                 max_plays=max_plays,
                 cooldown_hours=cooldown_hours,
                 **block,
@@ -579,7 +598,6 @@ async def _run_session(
     cycles: int | None = None,
     log_session: bool = False,
     engine: str = "realtime",
-    cached_only: bool = False,
     max_plays: int = 10,
     cooldown_hours: float = 12.0,
 ) -> str:
@@ -624,16 +642,19 @@ async def _run_session(
     # Mutable so [e] can switch engines mid-session
     current_engine = engine
     paid_requests_total = 0
+    switch_to: str | None = None  # engine to change to at the next reconnect
+    offline_fallback_reason: str | None = None  # why we dropped to saved tracks
+    library_ok: bool | None = None  # memo: can offline mode play anything?
 
     def make_client(phase: str):
-        if current_engine == "lyria-3.5" and not use_mock:
+        if current_engine in ("lyria-3.5", "offline") and not use_mock:
             from focus.generation.track_client import TrackClient
 
             return TrackClient(
                 build_config(phase),
                 profile=profile.name,
                 verbose=verbose,
-                cached_only=cached_only,
+                offline=current_engine == "offline",
                 main_prompt=profile.prompt,
                 max_plays=max_plays,
                 cooldown_hours=cooldown_hours,
@@ -795,6 +816,20 @@ async def _run_session(
             reconnect = False
 
             async for chunk in stream:
+                # Live engine lost (e.g. no network) and fell back to the synth:
+                # play the saved library instead, if there is one.
+                if (
+                    not use_mock
+                    and current_engine != "offline"
+                    and getattr(client, "using_synth", False)
+                ):
+                    if library_ok is None:
+                        library_ok = library_available(profile.name)
+                    if library_ok:
+                        offline_fallback_reason = getattr(client, "fallback_reason", None)
+                        switch_to = "offline"
+                        reconnect = True
+                        break
                 chunk_count += 1
                 chunk_seconds = len(chunk) / sample_rate
                 total_seconds += chunk_seconds
@@ -960,10 +995,10 @@ async def _run_session(
                         client.skip()
                         state.skip_requested = False
                     if state.engine_switch_requested:
-                        target = "lyria-3.5" if current_engine == "realtime" else "realtime"
-                        if use_mock or not engine_available(target, cached_only, profile.name):
-                            state.engine_switch_requested = False  # nothing to switch to
-                        else:
+                        state.engine_switch_requested = False
+                        target = None if use_mock else next_engine(current_engine, profile.name)
+                        if target is not None:
+                            switch_to = target
                             reconnect = True
                             break
                     if state.paused or state.skip_requested:
@@ -979,25 +1014,28 @@ async def _run_session(
             except Exception:
                 pass
 
+            # Swap engines in place ([e], or the automatic drop to offline):
+            # same profile and phase, fresh fade-in
+            if switch_to is not None and not session_complete:
+                target, switch_to = switch_to, None
+                if state is not None:
+                    state.status = "reconnecting"
+                    state.engine_label = target
+                    if status_line is not None:
+                        status_line.render(state)
+                paid_requests_total += getattr(client, "paid_requests", 0) or 0
+                await client.stop()
+                current_engine = target
+                client = make_client(current_phase)
+                await client.connect()
+                fade_in_samples_remaining = int(fade_duration * sample_rate)
+                continue
+
             # End the session unless an interactive control asked to reconnect
             if session_complete or state is None or not reconnect:
                 break
 
             # Pause: tear the session down (stops burning quota), wait, reconnect
-            if state.engine_switch_requested:
-                # Swap engines in place: same profile and phase, fresh fade-in
-                state.engine_switch_requested = False
-                state.status = "reconnecting"
-                if status_line is not None:
-                    status_line.render(state)
-                paid_requests_total += getattr(client, "paid_requests", 0) or 0
-                await client.stop()
-                current_engine = "lyria-3.5" if current_engine == "realtime" else "realtime"
-                state.engine_label = current_engine
-                client = make_client(current_phase)
-                await client.connect()
-                fade_in_samples_remaining = int(fade_duration * sample_rate)
-                continue
 
             resumable = getattr(client, "resumable", False)
             if state.paused:
@@ -1070,6 +1108,12 @@ async def _run_session(
         if session_error is not None:
             click.echo(f"   ⚠️  Session error: {session_error}", err=True)
         fallback_reason = getattr(client, "fallback_reason", None)
+        if offline_fallback_reason:
+            click.echo(
+                f"   ⚠️  Lost the live stream ({offline_fallback_reason}); "
+                "switched to your saved tracks.",
+                err=True,
+            )
         if log_session and total_seconds > 0:
             record = SessionRecord(
                 started_at=started_at,
@@ -1086,7 +1130,7 @@ async def _run_session(
                 ),
                 paid_requests=(
                     paid_requests_total + (getattr(client, "paid_requests", 0) or 0)
-                    if current_engine == "lyria-3.5" or paid_requests_total
+                    if current_engine != "realtime" or paid_requests_total
                     else None
                 ),
                 modulation_freq=profile.modulation_freq,
@@ -1108,7 +1152,7 @@ async def _run_session(
         elif fallback_reason:
             click.echo(
                 f"   ⚠️  Lyria 3.5 stopped generating ({fallback_reason}); "
-                "played cached tracks instead.",
+                "switched to your saved tracks.",
                 err=True,
             )
         if verbose:

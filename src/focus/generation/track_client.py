@@ -8,8 +8,8 @@ real-time client so the CLI pipeline is unchanged.
 
 Every generated track is kept in a :class:`TrackCache` library and reused
 while it has fewer than 10 plays and hasn't played in the last 12 hours; a new
-track is generated only when nothing qualifies. ``cached_only`` replays the
-library without making any paid requests.
+track is generated only when nothing qualifies. ``offline`` plays the saved
+library only, ignoring the cap and cooldown, with no network calls at all.
 """
 
 import asyncio
@@ -111,7 +111,6 @@ def decode_audio(data: bytes, sample_rate: int) -> np.ndarray:
 class TrackClient:
     """Lyria 3.5 engine with ahead-of-time generation, blending and caching."""
 
-    engine_name = MODEL
     resumable = True  # pause / next keep this client (and its queue) alive
 
     def __init__(
@@ -119,7 +118,7 @@ class TrackClient:
         config: LyriaConfig,
         profile: str,
         verbose: bool = False,
-        cached_only: bool = False,
+        offline: bool = False,
         cache: TrackCache | None = None,
         main_prompt: str | None = None,
         max_plays: int = DEFAULT_MAX_PLAYS,
@@ -127,7 +126,7 @@ class TrackClient:
     ):
         self.config = config
         self.verbose = verbose
-        self.cached_only = cached_only
+        self.offline = offline
         self.cache = cache or TrackCache(
             profile, max_plays=max_plays, cooldown_hours=cooldown_hours
         )
@@ -150,6 +149,10 @@ class TrackClient:
         self._synth: EnhancedSynthClient | None = None
 
     @property
+    def engine_name(self) -> str:
+        return "offline" if self.offline else MODEL
+
+    @property
     def using_synth(self) -> bool:
         """True once generation failed with no cache to fall back on."""
         return self._synth is not None
@@ -158,11 +161,14 @@ class TrackClient:
 
     async def connect(self, api_key: str | None = None) -> None:
         self._running = True
-        if self.cached_only:
+        if self.offline:
+            if not self.cache.tracks():
+                # Nothing saved for this profile: borrow every profile's tracks
+                self.cache = TrackCache(None, root=self.cache.root)
             if not self.cache.tracks():
                 raise ValueError(
-                    f"No cached tracks for this profile yet ({self.cache.dir}). "
-                    "Run once without --cached-only to build the library."
+                    f"No saved tracks yet ({self.cache.root}). Play some sessions with "
+                    "--engine lyria-3.5 to build the library."
                 )
             return
         api_key = api_key or resolve_api_key()
@@ -254,7 +260,7 @@ class TrackClient:
             return
         self._pending.discard(path)
         self._recent.append(path)
-        self.cache.record_play(path)
+        self.cache.record_play(path, count=not self.offline)
         if reused:
             self.reused_tracks += 1
 
@@ -265,17 +271,17 @@ class TrackClient:
         cooldown); otherwise generate a new one. If generation fails for good,
         keep going on the library (cap and cooldown relaxed), else the synth.
         """
+        if self.offline:
+            return self._load_cached(relaxed=True)
         reused = self._load_cached(relaxed=False)
         if reused is not None:
             return reused
-        if self.cached_only:
-            return self._load_cached(relaxed=True)
         generated = await self._generate()
         if generated is not None:
             return generated
         fallback = self._load_cached(relaxed=True)
         if fallback is not None:
-            self.cached_only = True
+            self.offline = True
             return fallback
         self._synth = EnhancedSynthClient(self.config, verbose=self.verbose)
         await self._synth.connect()

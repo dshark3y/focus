@@ -43,14 +43,16 @@ class TrackCache:
 
     def __init__(
         self,
-        profile: str,
+        profile: str | None,
         root: Path | None = None,
         max_mb: int | None = None,
         max_plays: int = DEFAULT_MAX_PLAYS,
         cooldown_hours: float = DEFAULT_COOLDOWN_HOURS,
     ):
         self.root = root or cache_root()
-        self.dir = self.root / _slug(profile)
+        # profile=None reads every profile's tracks (offline fallback); it can't save
+        self.dir = self.root / _slug(profile) if profile else self.root
+        self.all_profiles = profile is None
         env_mb = os.environ.get("FOCUS_CACHE_MAX_MB")
         self.max_bytes = int(max_mb or (int(env_mb) if env_mb else DEFAULT_CACHE_MB)) * 1024**2
         self.max_plays = max_plays
@@ -61,7 +63,8 @@ class TrackCache:
     def tracks(self) -> list[Path]:
         if not self.dir.exists():
             return []
-        return sorted(p for p in self.dir.iterdir() if p.suffix in AUDIO_SUFFIXES)
+        pattern = "*/*" if self.all_profiles else "*"
+        return sorted(p for p in self.dir.glob(pattern) if p.suffix in AUDIO_SUFFIXES)
 
     def meta(self, track: Path) -> dict:
         try:
@@ -90,6 +93,8 @@ class TrackCache:
 
     def save(self, data: bytes, prompt: str) -> Path | None:
         """Store a new track (best-effort); returns its path or None on failure."""
+        if self.all_profiles:
+            return None
         try:
             self.dir.mkdir(parents=True, exist_ok=True)
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
@@ -102,12 +107,19 @@ class TrackCache:
         except OSError:
             return None
 
-    def record_play(self, track: Path) -> None:
-        """Count one play (called when the track actually starts playing)."""
+    def record_play(self, track: Path, count: bool = True) -> None:
+        """Record a play when the track actually starts.
+
+        ``count=False`` (offline mode) only updates ``last_played``, so offline
+        listening rotates fairly without using up a track's play cap.
+        """
         if not track.exists():
             return
         meta = self.meta(track)
-        meta["plays"] = int(meta.get("plays", 0)) + 1
+        if count:
+            meta["plays"] = int(meta.get("plays", 0)) + 1
+        else:
+            meta["offline_plays"] = int(meta.get("offline_plays", 0)) + 1
         meta["last_played"] = _now().isoformat(timespec="seconds")
         self._write_meta(track, meta)
 
@@ -118,8 +130,9 @@ class TrackCache:
 
         Strict (default): fewer than ``max_plays`` plays, not played within the
         cooldown, not in ``avoid``; least-played first, random among ties.
-        Relaxed (for ``--cached-only`` once the library is exhausted): any
-        track not in ``avoid`` (else any track), longest-unplayed first.
+        Relaxed (offline mode): any track, ignoring cap and cooldown, not in
+        ``avoid`` when possible; never-played first, then longest since last
+        played, so the whole library rotates before anything repeats.
         """
         avoid = avoid or set()
         tracks = self.tracks()

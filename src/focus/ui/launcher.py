@@ -50,10 +50,11 @@ def _getch(fd: int | None = None) -> bytes:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
-ENGINES = ("realtime", "lyria-3.5")
+ENGINES = ("realtime", "lyria-3.5", "offline")
 ENGINE_NOTES = {
     "realtime": "live endless stream",
     "lyria-3.5": "generated tracks, reused from your library",
+    "offline": "saved tracks only, no network",
 }
 
 

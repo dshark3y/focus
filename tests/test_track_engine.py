@@ -131,11 +131,11 @@ class FakeInteractions:
         return SimpleNamespace(output_audio=SimpleNamespace(data=data))
 
 
-def make_client(tmp_path, fake=None, cached_only=False):
+def make_client(tmp_path, fake=None, offline=False):
     client = TrackClient(
         LyriaConfig(prompt="Dark ambient", bpm=110),
         profile="deep-work",
-        cached_only=cached_only,
+        offline=offline,
         cache=TrackCache("deep-work", root=tmp_path),
     )
     client._running = True
@@ -209,17 +209,35 @@ class TestTrackClient:
         assert client.using_synth
         assert "API key not valid" in client.fallback_reason
 
-    def test_cached_only_plays_library_without_requests(self, tmp_path):
+    def test_offline_plays_library_without_requests(self, tmp_path):
         cache = TrackCache("deep-work", root=tmp_path)
         cache.save(wav_bytes(tone(12, sr=48000), 48000), "p")
-        client = make_client(tmp_path, cached_only=True)
+        client = make_client(tmp_path, offline=True)
         assert asyncio.run(collect(client, 5.0)) >= 5.0
         assert client.paid_requests == 0
+        assert client.engine_name == "offline"
 
-    def test_cached_only_with_empty_cache_errors_clearly(self, tmp_path):
-        client = make_client(tmp_path, cached_only=True)
-        with pytest.raises(ValueError, match="No cached tracks"):
+    def test_offline_with_empty_library_errors_clearly(self, tmp_path):
+        client = make_client(tmp_path, offline=True)
+        with pytest.raises(ValueError, match="No saved tracks"):
             asyncio.run(client.connect())
+
+    def test_offline_ignores_cap_and_cooldown_and_does_not_count(self, tmp_path):
+        lib = TrackCache("deep-work", root=tmp_path, max_plays=1, cooldown_hours=12)
+        track = lib.save(wav_bytes(tone(12, sr=48000), 48000), "p")
+        lib.record_play(track)  # retired and cooling down
+        client = make_client(tmp_path, offline=True)
+        client.cache = lib
+        asyncio.run(client.connect())
+        asyncio.run(collect(client, 3.0))
+        assert lib.plays(track) == 1  # offline play recorded without counting
+        assert lib.meta(track)["offline_plays"] == 1
+
+    def test_offline_borrows_other_profiles_tracks(self, tmp_path):
+        TrackCache("light-study", root=tmp_path).save(wav_bytes(tone(12, sr=48000), 48000), "p")
+        client = make_client(tmp_path, offline=True)  # deep-work has nothing saved
+        asyncio.run(client.connect())
+        assert asyncio.run(collect(client, 3.0)) >= 3.0
 
     def test_cache_prunes_oldest_beyond_cap(self, tmp_path):
         cache = TrackCache("deep-work", root=tmp_path, max_mb=1)
@@ -307,3 +325,88 @@ class TestReuseInEngine:
         mixer.push(tone(5), on_start=lambda: started.append("b"))
         mixer.read(SR)
         assert started == ["a"]
+
+
+class TestOfflineCli:
+    def test_next_engine_cycles_and_skips_unavailable(self, tmp_path, monkeypatch):
+        from focus import cli
+
+        monkeypatch.setenv("FOCUS_CACHE_DIR", str(tmp_path))
+        monkeypatch.setenv("GEMINI_API_KEY", "k")
+        monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+        assert cli.next_engine("realtime", "deep-work") == "lyria-3.5"
+        assert cli.next_engine("lyria-3.5", "deep-work") == "realtime"  # no library yet
+        TrackCache("deep-work", root=tmp_path).save(wav_bytes(tone(1, sr=48000), 48000), "p")
+        assert cli.next_engine("lyria-3.5", "deep-work") == "offline"
+        monkeypatch.delenv("GEMINI_API_KEY")
+        assert cli.next_engine("offline", "deep-work") is None  # nothing else can run
+
+    def test_cached_only_alias_and_offline_flag_select_offline(self, monkeypatch):
+        from click.testing import CliRunner
+
+        from focus import cli
+
+        seen = {}
+        monkeypatch.setattr(cli, "launch_session", lambda **kw: seen.update(kw))
+        for flag in ("--offline", "--cached-only"):
+            CliRunner().invoke(cli.main, ["start", flag])
+            assert seen["engine"] == "offline"
+
+    def test_offline_without_library_fails_fast(self, tmp_path, monkeypatch):
+        from click.testing import CliRunner
+
+        from focus import cli
+
+        monkeypatch.setenv("FOCUS_CACHE_DIR", str(tmp_path))
+        result = CliRunner().invoke(cli.main, ["start", "--engine", "offline"])
+        assert result.exit_code == 1
+        assert "no saved tracks" in result.output
+
+
+class FakeRealtime:
+    """A realtime client that has lost the network and is playing the synth."""
+
+    resumable = False
+    engine_name = "realtime"
+    using_synth = True
+    fallback_reason = "connection refused"
+
+    async def connect(self, api_key=None):
+        pass
+
+    async def generate_stream(self):
+        while True:
+            yield np.zeros((9600, 2), dtype=np.float32)
+            await asyncio.sleep(0)
+
+    async def stop(self):
+        pass
+
+    async def set_prompt(self, prompt):
+        pass
+
+
+def test_lost_stream_drops_to_saved_tracks(tmp_path, monkeypatch):
+    import focus.audio.output as out
+    from focus import cli
+    from focus.profiles import get_profile
+    from focus.session_log import read_records
+
+    class FakeStream:
+        def __init__(self, **kw):
+            pass
+
+        start = stop = close = lambda self: None
+
+    monkeypatch.setattr(out.sd, "OutputStream", FakeStream)
+    monkeypatch.setenv("FOCUS_CACHE_DIR", str(tmp_path / "lib"))
+    monkeypatch.setenv("FOCUS_LOG_PATH", str(tmp_path / "log.jsonl"))
+    TrackCache("deep-work", root=tmp_path / "lib").save(wav_bytes(tone(30, sr=48000), 48000), "p")
+    monkeypatch.setattr(cli, "create_client", lambda *a, **k: FakeRealtime())
+    outcome = asyncio.run(
+        cli._run_session(get_profile("deep-work"), False, 60, log_session=True, spectrum=False)
+    )
+    assert outcome == "completed"
+    record = read_records()[-1]
+    assert record["engine"] == "offline"
+    assert record["audio_seconds"] >= 60
