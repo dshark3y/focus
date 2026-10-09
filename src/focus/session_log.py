@@ -12,6 +12,8 @@ from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+LYRIA_35_USD_PER_TRACK = 0.08  # Gemini API paid tier, checked 2026-10-09
+
 
 @dataclass
 class SessionRecord:
@@ -24,7 +26,9 @@ class SessionRecord:
     planned_seconds: int | None  # None for open-ended sessions
     audio_seconds: float  # music actually streamed (pauses don't count)
     outcome: str  # completed | quit | interrupted | ended | error
-    engine: str  # lyria (realtime) | lyria-3.5 | synth
+    engine: (
+        str  # realtime | lyria-3.5 | synth  (records before 2026-10-09 say "lyria" for realtime)
+    )
     modulation_freq: float
     modulation_depth: float
     fallback_reason: str | None = None
@@ -89,6 +93,8 @@ def summarize(records: list[dict], days: int = 7, today: date | None = None) -> 
             "sessions": 0,
             "completed_work_blocks": 0,
             "by_profile": defaultdict(float),
+            "by_engine": defaultdict(float),
+            "paid_tracks": 0,
         }
 
     for r in records:
@@ -100,12 +106,15 @@ def summarize(records: list[dict], days: int = 7, today: date | None = None) -> 
         day = per_day.get(d)
         if day is None:
             continue
+        day["paid_tracks"] += int(r.get("paid_requests") or 0)
         if r.get("kind") == "break":
             day["break_minutes"] += minutes
             continue
         day["focus_minutes"] += minutes
         day["sessions"] += 1
         day["by_profile"][r.get("profile", "?")] += minutes
+        engine = r.get("engine", "?")
+        day["by_engine"]["realtime" if engine == "lyria" else engine] += minutes  # old label
         if r.get("kind") == "work" and r.get("outcome") == "completed":
             day["completed_work_blocks"] += 1
 
@@ -115,6 +124,8 @@ def summarize(records: list[dict], days: int = 7, today: date | None = None) -> 
         day["focus_minutes"] = round(day["focus_minutes"], 1)
         day["break_minutes"] = round(day["break_minutes"], 1)
         day["by_profile"] = {k: round(v, 1) for k, v in sorted(day["by_profile"].items())}
+        day["by_engine"] = {k: round(v, 1) for k, v in sorted(day["by_engine"].items())}
+        day["est_cost_usd"] = round(day["paid_tracks"] * LYRIA_35_USD_PER_TRACK, 2)
         rows.append(day)
     return {
         "from": first.isoformat(),
@@ -122,6 +133,8 @@ def summarize(records: list[dict], days: int = 7, today: date | None = None) -> 
         "days": rows,
         "total_focus_minutes": round(sum(r["focus_minutes"] for r in rows), 1),
         "total_sessions": sum(r["sessions"] for r in rows),
+        "total_paid_tracks": sum(r["paid_tracks"] for r in rows),
+        "total_est_cost_usd": round(sum(r["est_cost_usd"] for r in rows), 2),
     }
 
 
@@ -145,6 +158,8 @@ def format_summary(summary: dict) -> str:
             parts.append(f"{format_minutes(day['break_minutes'])} break")
         if day["completed_work_blocks"]:
             parts.append(f"{day['completed_work_blocks']} 🍅")
+        if day["paid_tracks"]:
+            parts.append(f"{day['paid_tracks']} new tracks ≈ ${day['est_cost_usd']:.2f}")
         profiles = ", ".join(f"{k} {format_minutes(v)}" for k, v in day["by_profile"].items())
         if profiles:
             parts.append(profiles)

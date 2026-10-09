@@ -132,6 +132,17 @@ class TestSessionLog:
         assert today["sessions"] == 2
         assert yesterday["by_profile"] == {"light-study": 10.0}
         assert summary["total_focus_minutes"] == 45.0
+        assert today["by_engine"] == {"realtime": 35.0}  # old "lyria" label mapped
+
+    def test_summary_counts_paid_tracks_and_cost(self, tmp_path):
+        path = tmp_path / "s.jsonl"
+        rec = _record("2026-10-09T09:00:00+04:00")
+        rec.engine, rec.paid_requests = "lyria-3.5", 3
+        append_record(rec, path)
+        summary = summarize(read_records(path), days=1, today=date(2026, 10, 9))
+        assert summary["days"][0]["paid_tracks"] == 3
+        assert summary["days"][0]["est_cost_usd"] == 0.24
+        assert summary["total_est_cost_usd"] == 0.24
 
     def test_format_minutes(self):
         assert format_minutes(25) == "25m"

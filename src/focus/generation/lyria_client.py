@@ -273,6 +273,8 @@ class LyriaClient:
     dual-session crossfade so track transitions are seamless (no audio gap).
     """
 
+    engine_name = "realtime"  # class attribute, not a dataclass field
+
     config: LyriaConfig
     session_duration: int = SESSION_MAX_DURATION_SECONDS  # Configurable rotation time
     _client: object = field(default=None, init=False, repr=False)
