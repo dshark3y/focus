@@ -26,9 +26,8 @@ class SessionRecord:
     planned_seconds: int | None  # None for open-ended sessions
     audio_seconds: float  # music actually streamed (pauses don't count)
     outcome: str  # completed | quit | interrupted | ended | error
-    engine: (
-        str  # realtime | lyria-3.5 | synth  (records before 2026-10-09 say "lyria" for realtime)
-    )
+    # realtime | lyria-3.5 | synth (records before 2026-10-09 say "lyria" for realtime)
+    engine: str
     modulation_freq: float
     modulation_depth: float
     fallback_reason: str | None = None
