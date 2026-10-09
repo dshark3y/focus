@@ -481,7 +481,10 @@ def launch_session(
     if output:
         click.echo(f"   Output: {output}")
     if sys.stdin.isatty() and sys.stdout.isatty():
-        click.echo("\n   Controls: [space] pause  [n] next take  [↑↓] volume  [?] help  [q] quit\n")
+        controls = "[space] pause  [n] next  [↑↓] volume  [?] help  [q] quit"
+        if not mock:
+            controls = controls.replace("[n] next", "[n] next  [e] switch engine")
+        click.echo(f"\n   Controls: {controls}\n")
     else:
         click.echo("\n   Press Ctrl+C to stop\n")
 
